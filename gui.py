@@ -55,8 +55,7 @@ def dashboard():
             # WATCHLIST
             with ui.card().style('width:200px;height:650px;background:linear-gradient(180deg,#1E293B,#111827);border:1px solid #334155;border-radius:16px;' ):
                 ui.label('WATCHLIST').classes('text-h6').style('color:white;font-size:16px')
-                watchlist = [('TATA STEEL', '24013', '-0.64%'),('HDFC', '57685', '-0.48%'),
-                             ('ASIAN PAINTS', '1309', '-1.40%'),('NTPC', '1520', '+0.60%'),]
+                watchlist = [('NIFTY 50', '24013', '-0.64%'),('BANK NIFTY', '57685', '-0.48%'),]
                 for stock, price, change in watchlist:
                     color = '#22C55E' if '+' in change else '#EF4444'
                     with ui.card().style('background:linear-gradient(0deg,#1E293B,#111827); width:100%;'):
@@ -76,29 +75,29 @@ def dashboard():
         with ui.card().style('width:300px;height:720px;background:linear-gradient(180deg,#1E293B,#111827);border:1px solid #22C55E;box-shadow:0 0 15px rgba(34,197,94,0.25);border-radius:16px;overflow-y:auto;padding:12px;'):
             ui.label('LONG SETUP DETECTED').style('''background:#14532D;color:white;padding:12px;border-radius:10px;font-size:22px;font-weight:bold;''')
             ui.separator()
+            ui.label('Confidence Score :91%').style('color:#22C55E;font-size:24px;font-weight:bold')
+            ui.linear_progress(value=0.91).props('color=green')
             with ui.column().style('gap:3px'):
-                with ui.row():
-                    ui.icon('check_circle').style('color:#22C55E')
-                    ui.label('Trend Filter').style('color:green')
-                with ui.row():
-                    ui.icon('check_circle').style('color:#22C55E')
-                    ui.label('Liquidity Sweep').style('color:green')
-                with ui.row():
-                    ui.icon('check_circle').style('color:#22C55E')
-                    ui.label('Volume Profile').style('color:green')
-                with ui.row():
-                    ui.icon('check_circle').style('color:#22C55E')
-                    ui.label('Regime Filter').style('color:green')
-                with ui.row():
-                    ui.icon('check_circle').style('color:#22C55E')
-                    ui.label('ADX Filter').style('color:green')
-                ui.label('Confidence Score :91%').style('color:#22C55E;font-size:24px;font-weight:bold')
-                ui.linear_progress(value=0.91).props('color=green')
-                ui.separator()
-                ui.label('Reason For Trade').style('color:white;font-size:18px')
-                ui.label('Daily Bullish ✓').style('color:green')
-                ui.label('15 min Bullish ✓').style('color:green')
-                ui.label('5m Bullish ✓').style('color:green')
+                with ui.expansion('Trade Protocols').style('color:white'):
+                    with ui.row():
+                        ui.icon('check_circle').style('color:#22C55E')
+                        ui.label('Trend Filter').style('color:green')
+                    with ui.row():
+                        ui.icon('check_circle').style('color:#22C55E')
+                        ui.label('Liquidity Sweep').style('color:green')
+                    with ui.row():
+                        ui.icon('check_circle').style('color:#22C55E')
+                        ui.label('Volume Profile').style('color:green')
+                    with ui.row():
+                        ui.icon('check_circle').style('color:#22C55E')
+                        ui.label('Regime Filter').style('color:green')
+                    with ui.row():
+                        ui.icon('check_circle').style('color:#22C55E')
+                        ui.label('ADX Filter').style('color:green')
+                    ui.separator()
+                    ui.label('Daily Bullish ✓').style('color:green')
+                    ui.label('15 min Bullish ✓').style('color:green')
+                    ui.label('5m Bullish ✓').style('color:green')
                 with ui.expansion('Trade Calculator', value=True).style('color:white'):
                     entry = ui.number(label='Entry Price')
                     entry.props('outlined color=green dark')
