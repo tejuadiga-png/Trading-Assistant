@@ -1,7 +1,7 @@
 from nicegui import ui
 import plotly.graph_objects as go
 logged_in=False
-PASSWORD = 'group123'
+PASSWORD = 'Tapasyagarhwalih'
 
 @ui.page('/')
 def login_page():
@@ -109,6 +109,6 @@ def dashboard():
                             target.set_text(f'Target: {entry.value +75}')
                             sl.set_text(f'Stop Loss: {entry.value - 37.5}')
                     ui.button('Calculate',on_click=calc)
-
-ui.run(host='0.0.0.0',port=8080)
+import os
+ui.run(host='0.0.0.0',port=int(os.environ.get('PORT', 8080)))
     
