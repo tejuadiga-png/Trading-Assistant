@@ -40,11 +40,7 @@ def dashboard():
         ])
     fig.update_layout(xaxis_rangeslider_visible=False,template='plotly_dark',title='BANKNIFTY(demo)',height=700,)
     # Header
-    ui.label('Trading Assistant').classes('text-h2 text-center font-bold w-full').style('color:white')
-    with ui.row().classes('w-full justify-center'):
-        ui.label('BAJAJ BANK 24,013 ▼0.64%').style('color:#EF4444; font-size:18px; margin-right:30px')
-        ui.label('TATA STEEL 57,685 ▼0.48%').style('color:#EF4444; font-size:18px; margin-right:30px' )
-        ui.label('HDFC 1309 ▼1.40%').style('color:#EF4444; font-size:18px')
+    ui.label('Trading Assistant').classes('text-base font-bold w-full').style('color:white')#change alignment to left corner text size small
 
     # Main Layout
     with ui.row().classes('w-full'):
@@ -74,6 +70,8 @@ def dashboard():
             # SIGNAL PANEL
         with ui.card().style('width:300px;height:720px;background:linear-gradient(180deg,#1E293B,#111827);border:1px solid #22C55E;box-shadow:0 0 15px rgba(34,197,94,0.25);border-radius:16px;overflow-y:auto;padding:12px;'):
             ui.label('LONG SETUP DETECTED').style('''background:#14532D;color:white;padding:12px;border-radius:10px;font-size:22px;font-weight:bold;''')
+            #detect if volume changed abruptly
+            #also add the volume range thing(seeing the POC of the selected timeframe of market)
             ui.separator()
             ui.label('Confidence Score :91%').style('color:#22C55E;font-size:24px;font-weight:bold')
             ui.linear_progress(value=0.91).props('color=green')
