@@ -1,7 +1,7 @@
 from nicegui import ui
 import plotly.graph_objects as go
 logged_in=False
-PASSWORD = 'Tapasyagarhwalih'
+PASSWORD = 'model2026'
 
 @ui.page('/')
 def login_page():
@@ -25,20 +25,31 @@ def dashboard():
     ui.dark_mode()
     ui.query('body').style('''background: linear-gradient(135deg,#130721 0%,#1E1B4B 50%,#0F172A 100%);margin:0;padding:0;''')
     # Fake Chart
-    fig = go.Figure(data=[
-        go.Candlestick(
-            x=['9:15','9:30','9:45','10:00','10:15','10:30'],
-            open=[25000,25020,25010,25050,25040,25080],
-            high=[25030,25040,25060,25070,25100,25130],
-            low=[24990,25000,25000,25020,25030,25070],
-            close=[25020,25010,25050,25040,25080,25120],
-            increasing_fillcolor='#22C55E',
-            increasing_line_color='#22C55E',
-            decreasing_fillcolor='#EF4444',
-            decreasing_line_color='#EF4444',
-            )
-        ])
-    fig.update_layout(xaxis_rangeslider_visible=False,template='plotly_dark',title='BANKNIFTY(demo)',height=700,)
+    fig = go.Figure()
+    fig.update_layout(template='plotly_dark',title='Select a Market',xaxis_rangeslider_visible=False,height=700,)
+    def show_chart(symbol):
+        if symbol == "BANK NIFTY":
+            fig = go.Figure(data=[go.Candlestick(
+                x=['9:15','9:30','9:45','10:00','10:15','10:30'],
+                open=[25000,25020,25010,25050,25040,25080],
+                high=[25030,25040,25060,25070,25100,25130],
+                low=[24990,25000,25000,25020,25030,25070],
+                close=[25020,25010,25050,25040,25080,25120],
+                )
+                                  ])
+            fig.update_layout(template='plotly_dark',title='BANKNIFTY',xaxis_rangeslider_visible=False,height=700,)
+        elif symbol == "NIFTY 50":
+            fig = go.Figure(data=[go.Candlestick(
+                x=['9:15','9:30','9:45','10:00','10:15','10:30'],
+                open=[24800,24840,24820,24860,24850,24890],
+                high=[24860,24870,24880,24900,24910,24940],
+                low=[24790,24800,24810,24830,24840,24870],
+                close=[24840,24820,24860,24850,24890,24920],
+                )
+                                  ])
+            fig.update_layout(template='plotly_dark',title='NIFTY',xaxis_rangeslider_visible=False,height=700,)
+        plot.figure = fig
+        plot.update()
     # Header
     ui.label('Trading Assistant').classes('text-base font-bold w-full').style('color:white')#change alignment to left corner text size small
 
@@ -54,14 +65,15 @@ def dashboard():
                 watchlist = [('NIFTY 50', '24013', '-0.64%'),('BANK NIFTY', '57685', '-0.48%'),]
                 for stock, price, change in watchlist:
                     color = '#22C55E' if '+' in change else '#EF4444'
-                    with ui.card().style('background:linear-gradient(0deg,#1E293B,#111827); width:100%;'):
+                    with ui.card().classes('cursor-pointer').style('background:linear-gradient(0deg,#1E293B,#111827); width:100%;') as card:
                         ui.label(stock).style('color:white')
                         ui.label(price).style('color:white')
                         ui.label(change).style(f'color:{color}')
+                    card.on('click', lambda s=stock: show_chart(s))
         # CHART
         with ui.column().classes('grow'):
             with ui.card().style('''background:linear-gradient(180deg,#1E293B,#111827;border-radius:16px;width:100%;height:720px;'''):
-                ui.plotly(fig).style('width:100%;height:650px')
+                plot=ui.plotly(fig).style('width:100%;height:650px')
                 with ui.row().classes('w-full justify-around'):
                     ui.label('Market Bias: Bullish').style('color:#22C55E')
                     ui.label('Volume Profile: Near VAL').style('color:#38BDF8')
