@@ -1,0 +1,4 @@
+private.env
+__pycache__/
+*.pyc
+gui(og)

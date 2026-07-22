@@ -1,2 +1,5 @@
 nicegui
 plotly
+python-dotenv
+requests
+upstox-python-sdk
