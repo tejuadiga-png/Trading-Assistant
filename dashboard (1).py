@@ -9,7 +9,8 @@ import pytz
 from upstox import get_live_nifty, get_historical_nifty
 
 # Try to import option chain from upstox module — add get_option_chain()
-# to your upstox.py once Upstox API is wired; falls back to mock if absent.
+# to your upstox.py to enable live data; the option chain panel shows an
+# empty state until this is wired up.
 try:
     from upstox import get_option_chain
     UPSTOX_CHAIN_AVAILABLE = True
@@ -278,7 +279,7 @@ def compute_conviction(symbol: str, bar_id: int = 0) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Option chain  — Upstox live data with mock fallback
+# Option chain  — Upstox live data only (no mock fallback)
 # ─────────────────────────────────────────────────────────────────────────
 
 def _fetch_upstox_chain(spot: float) -> list | None:
@@ -286,7 +287,8 @@ def _fetch_upstox_chain(spot: float) -> list | None:
     Expected shape from get_option_chain(): list of dicts with keys:
         strike_price, call_options.market_data.{ltp, oi, volume, iv, greeks},
         put_options.market_data.{ltp, oi, volume, iv, greeks}
-    Returns None on any failure so callers fall back to mock."""
+    Returns None on any failure; callers should handle the empty case
+    (no mock data is generated)."""
     if not UPSTOX_CHAIN_AVAILABLE:
         return None
     try:
@@ -318,9 +320,6 @@ def _fetch_upstox_chain(spot: float) -> list | None:
                 "put_chg":   round(float(pe.get("net_change", 0)), 1),
                 "put_iv":    round(float(pe_g.get("iv", 0)) * 100, 1),
                 "put_delta": round(float(pe_g.get("delta", 0)), 2),
-                # keep tv/seed fields for smooth mock-mode drift
-                "call_tv":   max(1.0, round(float(ce.get("ltp",0)) - max(spot-k,0), 1)),
-                "put_tv":    max(1.0, round(float(pe.get("ltp",0)) - max(k-spot,0), 1)),
             })
         rows.sort(key=lambda r: r["strike"])
         return rows or None
@@ -330,79 +329,27 @@ def _fetch_upstox_chain(spot: float) -> list | None:
 
 
 def make_option_chain(spot: float) -> list:
-    """Build strike ladder. Tries Upstox first, then falls back to mock."""
-    live = _fetch_upstox_chain(spot)
-    if live:
-        return live
-
-    # Mock fallback — stable RNG seed per strike so values don't jump between frames
-    atm = round(spot / STRIKE_STEP) * STRIKE_STEP
-    rows = []
-    for i in range(-CHAIN_WIDTH, CHAIN_WIDTH + 1):
-        k = atm + i * STRIKE_STEP
-        rng = random.Random(int(k) * 7919 + 13)
-        dist  = spot - k
-        decay = max(0.12, 1 - abs(dist) / 600)
-        ci    = max(dist, 0)
-        pi    = max(-dist, 0)
-        ctv   = round(rng.uniform(25, 160) * decay, 1)
-        ptv   = round(rng.uniform(25, 160) * decay, 1)
-        rows.append({
-            "strike":    k, "atm": k==atm, "itm_call": k<spot, "itm_put": k>spot,
-            "call_ltp":  round(ci+ctv, 1), "call_tv":   ctv,
-            "call_oi":   round(rng.uniform(0.4,9.6)*max(0.25,decay),2),
-            "call_chg":  0.0,
-            "call_iv":   round(rng.uniform(11,21),1),
-            "call_delta":round(min(0.99,max(0.01, 0.5+dist/500)),2),
-            "put_ltp":   round(pi+ptv, 1), "put_tv":    ptv,
-            "put_oi":    round(rng.uniform(0.4,9.6)*max(0.25,decay),2),
-            "put_chg":   0.0,
-            "put_iv":    round(rng.uniform(11,21),1),
-            "put_delta": round(min(-0.01,max(-0.99,-0.5+dist/500)),2),
-        })
-    return rows
+    """Build strike ladder from live Upstox data only.
+    Returns an empty list if Upstox isn't wired up or the fetch fails —
+    no mock data is generated."""
+    return _fetch_upstox_chain(spot) or []
 
 
 def update_option_chain(rows: list, spot: float) -> list:
-    """Drift existing chain toward new spot in-place.
-    Intrinsics recalculated exactly; OI/IV/time-value take a small random
-    walk so numbers move smoothly rather than jumping on every tick.
-    This random walk only ever runs while NSE is open — see refresh_chain()
-    in the dashboard, which skips calling this during closed hours."""
-    atm = round(spot / STRIKE_STEP) * STRIKE_STEP
-
-    # If Upstox chain is available, refresh fully each tick
-    if UPSTOX_CHAIN_AVAILABLE:
-        fresh = _fetch_upstox_chain(spot)
-        if fresh:
-            return fresh
-
-    for r in rows:
-        k    = r["strike"]
-        dist = spot - k
-        r["atm"]      = k == atm
-        r["itm_call"] = k < spot
-        r["itm_put"]  = k > spot
-
-        prev_cl, prev_pl = r["call_ltp"], r["put_ltp"]
-
-        r["call_tv"] = max(3.0, min(220.0, r["call_tv"] + random.uniform(-5, 5)))
-        r["put_tv"]  = max(3.0, min(220.0, r["put_tv"]  + random.uniform(-5, 5)))
-        r["call_ltp"] = round(max(dist,0)  + r["call_tv"], 1)
-        r["put_ltp"]  = round(max(-dist,0) + r["put_tv"],  1)
-
-        r["call_chg"] = round((r["call_ltp"]-prev_cl)/max(prev_cl,0.05)*100, 1)
-        r["put_chg"]  = round((r["put_ltp"] -prev_pl)/max(prev_pl, 0.05)*100, 1)
-        r["call_oi"]  = round(max(0.1, min(15.0, r["call_oi"] + random.uniform(-0.2,0.2))),2)
-        r["put_oi"]   = round(max(0.1, min(15.0, r["put_oi"]  + random.uniform(-0.2,0.2))),2)
-        r["call_iv"]  = round(max(9.0, min(25.0, r["call_iv"] + random.uniform(-0.4,0.4))),1)
-        r["put_iv"]   = round(max(9.0, min(25.0, r["put_iv"]  + random.uniform(-0.4,0.4))),1)
-        r["call_delta"]= round(min(0.99,max(0.01, 0.5+dist/500)),2)
-        r["put_delta"] = round(min(-0.01,max(-0.99,-0.5+dist/500)),2)
-    return rows
+    """Refresh the option chain from live Upstox data only.
+    No mock drift — if the live fetch fails, the previous rows are kept
+    as-is until the next successful fetch."""
+    fresh = _fetch_upstox_chain(spot)
+    return fresh if fresh else rows
 
 
 def render_option_chain(rows: list, opt_type: str) -> str:
+    if not rows:
+        return ('<div style="padding:24px 16px;text-align:center;color:#787B86;font-size:12px;">'
+                'No live option chain data available.<br>'
+                'Wire up <code>get_option_chain()</code> in <code>upstox.py</code> to populate this panel.'
+                '</div>')
+
     show_c = opt_type in ("ALL","CALL")
     show_p = opt_type in ("ALL","PUT")
 
@@ -714,19 +661,16 @@ def dashboard():
         refresh_signal_panel()
 
     def refresh_chain():
-        """Refresh the option-chain sidebar.
-        While NSE is open: mock mode drifts smoothly tick-to-tick, and if a
-        real Upstox chain endpoint is wired in, that's refetched every tick.
-        While NSE is closed: skip the random walk entirely so mock data
-        freezes at its last value; still try a real Upstox fetch (which will
-        itself just keep returning the last traded closing quotes)."""
+        """Refresh the option-chain sidebar from live Upstox data only.
+        While NSE is closed, still attempt a fetch (Upstox will just keep
+        returning the last traded closing quotes); if it fails, the panel
+        keeps showing whatever it last had (or the empty-state message)."""
         spot = live_state["spot"] or 24892
 
         if not is_market_open():
-            if UPSTOX_CHAIN_AVAILABLE:
-                fresh = _fetch_upstox_chain(spot)
-                if fresh:
-                    state["chain_rows"] = fresh
+            fresh = _fetch_upstox_chain(spot)
+            if fresh:
+                state["chain_rows"] = fresh
             render_chain_and_tabs()
             return
 

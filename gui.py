@@ -6,15 +6,7 @@ import time
 from datetime import datetime, timedelta
 import pytz
 
-from upstox import get_live_nifty, get_historical_nifty
-
-# Try to import option chain from upstox module — add get_option_chain()
-# to your upstox.py once Upstox API is wired; falls back to mock if absent.
-try:
-    from upstox import get_option_chain
-    UPSTOX_CHAIN_AVAILABLE = True
-except ImportError:
-    UPSTOX_CHAIN_AVAILABLE = False
+from upstox import get_live_nifty, get_historical_nifty, get_option_chain, get_expiries, get_status
 
 # ─────────────────────────────────────────────────────────────────────────
 # NSE / Nifty config
@@ -53,7 +45,8 @@ live_state = {
     "candles":       None,   # dict of lists: opens/highs/lows/closes/volumes/times
     "last_bucket":   None,   # datetime of current 5-min candle start
     "tf":            DEFAULT_TF,
-    "api_ok":        True,   # flips False when Upstox calls start failing
+    "api_ok":        True,   # flips False when the market data provider starts failing
+    "api_reason":    None,   # 'auth_expired' | 'network_error' | 'http_error' | 'no_token' | None
 }
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -71,7 +64,7 @@ MOCK_BASE = {
 def _make_times(n: int, tf: str) -> list:
     """Generate n bar timestamps going back from now, spaced by tf.
     Returns real datetime objects (not pre-formatted strings) so this
-    always matches the type used by real Upstox history and by
+    always matches the type used by real historical data and by
     update_live_candle — mixing datetime objects and strings in the same
     list confuses Plotly's date x-axis."""
     minutes = {"1m":1,"5m":5,"15m":15,"30m":30,"1H":60,"D":1440}.get(tf, 5)
@@ -86,18 +79,16 @@ def _make_times(n: int, tf: str) -> list:
 def fetch_candles_for_tf(tf: str) -> dict:
     """Fetch historical candles for the given timeframe.
     Returns dict with opens/highs/lows/closes/volumes/times lists.
-    Falls back to mock data if Upstox call fails."""
+    Falls back to mock data if the provider call fails."""
     interval, days_back, n_bars = TF_MAP[tf]
     try:
         raw = get_historical_nifty(interval=interval, days=days_back)
         candles = (raw or {}).get("data", {}).get("candles")
         if candles:
             candles = list(reversed(candles))[-n_bars:]
-            # FIX: build times from the candles themselves — `times_raw` was
-            # never defined in the original code, causing a NameError as soon
-            # as Upstox actually returned data.
             times = [datetime.fromisoformat(str(c[0])) for c in candles]
             live_state["api_ok"] = True
+            live_state["api_reason"] = None
             return {
                 "opens":   [c[1] for c in candles],
                 "highs":   [c[2] for c in candles],
@@ -108,7 +99,10 @@ def fetch_candles_for_tf(tf: str) -> dict:
             }
     except Exception as e:
         print(f"Historical fetch failed ({tf}): {e}")
-        live_state["api_ok"] = False
+
+    status = get_status()
+    live_state["api_ok"] = status.get("ok", False)
+    live_state["api_reason"] = status.get("reason")
 
     # Fallback: use mock base, truncate/repeat to n_bars
     base = MOCK_BASE
@@ -125,7 +119,9 @@ def fetch_candles_for_tf(tf: str) -> dict:
 
 def init_live_state():
     price = get_live_nifty()
+    status = get_status()
     live_state["api_ok"] = price is not None
+    live_state["api_reason"] = None if price is not None else status.get("reason")
     live_state["spot"]    = price or 24892.0
     live_state["candles"] = fetch_candles_for_tf(DEFAULT_TF)
     live_state["last_bucket"] = None
@@ -141,9 +137,12 @@ def update_live_candle():
         return
     price = get_live_nifty()
     if price is None:
+        status = get_status()
         live_state["api_ok"] = False
+        live_state["api_reason"] = status.get("reason")
         return
     live_state["api_ok"] = True
+    live_state["api_reason"] = None
     live_state["spot"] = price
     c = live_state["candles"]
     tf = live_state["tf"]
@@ -161,8 +160,6 @@ def update_live_candle():
     if bucket != live_state["last_bucket"]:
         # New bar
         last_close = c["closes"][-1]
-        # FIX: append the real datetime `bucket`, not a formatted string —
-        # c["times"] must stay one consistent type (see _make_times note).
         c["opens"].append(last_close)
         c["highs"].append(price)
         c["lows"].append(price)
@@ -199,8 +196,8 @@ DISPERSION_PENALTY = 0.8
 
 def mock_market_state(symbol: str, bar_id: int = 0) -> dict:
     """Deterministic per (symbol, bar_id) — same bar always gives same reading.
-    Order-flow/OI/FII-DII fields are still simulated until the Upstox
-    options-analytics endpoint is wired in (upstox.py)."""
+    Order-flow/OI/FII-DII fields are still simulated until a real
+    options-analytics endpoint is wired into a provider."""
     rng = random.Random(f"{symbol}-{bar_id}")
     return {
         "trend_aligned":          rng.random() > 0.3,
@@ -278,19 +275,19 @@ def compute_conviction(symbol: str, bar_id: int = 0) -> dict:
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Option chain  — Upstox live data with mock fallback
+# Option chain  — live provider data only (no mock fallback)
 # ─────────────────────────────────────────────────────────────────────────
 
-def _fetch_upstox_chain(spot: float) -> list | None:
-    """Try to pull a live option chain from Upstox.
+def _fetch_live_chain(spot: float, expiry: str | None = None) -> list | None:
+    """Try to pull a live option chain from the configured provider for a
+    given expiry (None = provider's nearest-expiry default).
     Expected shape from get_option_chain(): list of dicts with keys:
         strike_price, call_options.market_data.{ltp, oi, volume, iv, greeks},
         put_options.market_data.{ltp, oi, volume, iv, greeks}
-    Returns None on any failure so callers fall back to mock."""
-    if not UPSTOX_CHAIN_AVAILABLE:
-        return None
+    Returns None on any failure; callers should handle the empty case
+    (no mock data is generated)."""
     try:
-        raw = get_option_chain()          # your upstox.py should accept no args and return current weekly
+        raw = get_option_chain(expiry_date=expiry)
         if not raw:
             return None
         atm = round(spot / STRIKE_STEP) * STRIKE_STEP
@@ -303,6 +300,18 @@ def _fetch_upstox_chain(spot: float) -> list | None:
             pe = (item.get("put_options")  or {}).get("market_data", {})
             ce_g = (item.get("call_options") or {}).get("option_greeks", {})
             pe_g = (item.get("put_options")  or {}).get("option_greeks", {})
+
+            # Upstox's option chain response has no `net_change` field —
+            # only `ltp` and `close_price` (previous close). Derive the
+            # % change ourselves instead of reading a key that doesn't
+            # exist (which was silently returning 0 for every row).
+            def _pct_change(md: dict) -> float:
+                ltp = float(md.get("ltp", 0))
+                prev = float(md.get("close_price", 0))
+                if not prev:
+                    return 0.0
+                return (ltp - prev) / prev * 100
+
             rows.append({
                 "strike":    k,
                 "atm":       k == atm,
@@ -310,17 +319,17 @@ def _fetch_upstox_chain(spot: float) -> list | None:
                 "itm_put":   k > spot,
                 "call_ltp":  round(float(ce.get("ltp",  0)), 1),
                 "call_oi":   round(float(ce.get("oi",   0)) / 1e5, 2),
-                "call_chg":  round(float(ce.get("net_change", 0)), 1),
-                "call_iv":   round(float(ce_g.get("iv", 0)) * 100, 1),
+                "call_chg":  round(_pct_change(ce), 1),
+                # Upstox's `iv` is already a percentage (e.g. 50.78 = 50.78%),
+                # NOT a 0-1 fraction — multiplying by 100 was the bug behind
+                # the garbled IV numbers.
+                "call_iv":   round(float(ce_g.get("iv", 0)), 1),
                 "call_delta":round(float(ce_g.get("delta", 0)), 2),
                 "put_ltp":   round(float(pe.get("ltp",  0)), 1),
                 "put_oi":    round(float(pe.get("oi",   0)) / 1e5, 2),
-                "put_chg":   round(float(pe.get("net_change", 0)), 1),
-                "put_iv":    round(float(pe_g.get("iv", 0)) * 100, 1),
+                "put_chg":   round(_pct_change(pe), 1),
+                "put_iv":    round(float(pe_g.get("iv", 0)), 1),
                 "put_delta": round(float(pe_g.get("delta", 0)), 2),
-                # keep tv/seed fields for smooth mock-mode drift
-                "call_tv":   max(1.0, round(float(ce.get("ltp",0)) - max(spot-k,0), 1)),
-                "put_tv":    max(1.0, round(float(pe.get("ltp",0)) - max(k-spot,0), 1)),
             })
         rows.sort(key=lambda r: r["strike"])
         return rows or None
@@ -329,80 +338,34 @@ def _fetch_upstox_chain(spot: float) -> list | None:
         return None
 
 
-def make_option_chain(spot: float) -> list:
-    """Build strike ladder. Tries Upstox first, then falls back to mock."""
-    live = _fetch_upstox_chain(spot)
-    if live:
-        return live
-
-    # Mock fallback — stable RNG seed per strike so values don't jump between frames
-    atm = round(spot / STRIKE_STEP) * STRIKE_STEP
-    rows = []
-    for i in range(-CHAIN_WIDTH, CHAIN_WIDTH + 1):
-        k = atm + i * STRIKE_STEP
-        rng = random.Random(int(k) * 7919 + 13)
-        dist  = spot - k
-        decay = max(0.12, 1 - abs(dist) / 600)
-        ci    = max(dist, 0)
-        pi    = max(-dist, 0)
-        ctv   = round(rng.uniform(25, 160) * decay, 1)
-        ptv   = round(rng.uniform(25, 160) * decay, 1)
-        rows.append({
-            "strike":    k, "atm": k==atm, "itm_call": k<spot, "itm_put": k>spot,
-            "call_ltp":  round(ci+ctv, 1), "call_tv":   ctv,
-            "call_oi":   round(rng.uniform(0.4,9.6)*max(0.25,decay),2),
-            "call_chg":  0.0,
-            "call_iv":   round(rng.uniform(11,21),1),
-            "call_delta":round(min(0.99,max(0.01, 0.5+dist/500)),2),
-            "put_ltp":   round(pi+ptv, 1), "put_tv":    ptv,
-            "put_oi":    round(rng.uniform(0.4,9.6)*max(0.25,decay),2),
-            "put_chg":   0.0,
-            "put_iv":    round(rng.uniform(11,21),1),
-            "put_delta": round(min(-0.01,max(-0.99,-0.5+dist/500)),2),
-        })
-    return rows
+def make_option_chain(spot: float, expiry: str | None = None) -> list:
+    """Build strike ladder from live provider data only, for the given
+    expiry (None = provider's nearest-expiry default).
+    Returns an empty list if the fetch fails — no mock data is generated."""
+    return _fetch_live_chain(spot, expiry) or []
 
 
-def update_option_chain(rows: list, spot: float) -> list:
-    """Drift existing chain toward new spot in-place.
-    Intrinsics recalculated exactly; OI/IV/time-value take a small random
-    walk so numbers move smoothly rather than jumping on every tick.
-    This random walk only ever runs while NSE is open — see refresh_chain()
-    in the dashboard, which skips calling this during closed hours."""
-    atm = round(spot / STRIKE_STEP) * STRIKE_STEP
-
-    # If Upstox chain is available, refresh fully each tick
-    if UPSTOX_CHAIN_AVAILABLE:
-        fresh = _fetch_upstox_chain(spot)
-        if fresh:
-            return fresh
-
-    for r in rows:
-        k    = r["strike"]
-        dist = spot - k
-        r["atm"]      = k == atm
-        r["itm_call"] = k < spot
-        r["itm_put"]  = k > spot
-
-        prev_cl, prev_pl = r["call_ltp"], r["put_ltp"]
-
-        r["call_tv"] = max(3.0, min(220.0, r["call_tv"] + random.uniform(-5, 5)))
-        r["put_tv"]  = max(3.0, min(220.0, r["put_tv"]  + random.uniform(-5, 5)))
-        r["call_ltp"] = round(max(dist,0)  + r["call_tv"], 1)
-        r["put_ltp"]  = round(max(-dist,0) + r["put_tv"],  1)
-
-        r["call_chg"] = round((r["call_ltp"]-prev_cl)/max(prev_cl,0.05)*100, 1)
-        r["put_chg"]  = round((r["put_ltp"] -prev_pl)/max(prev_pl, 0.05)*100, 1)
-        r["call_oi"]  = round(max(0.1, min(15.0, r["call_oi"] + random.uniform(-0.2,0.2))),2)
-        r["put_oi"]   = round(max(0.1, min(15.0, r["put_oi"]  + random.uniform(-0.2,0.2))),2)
-        r["call_iv"]  = round(max(9.0, min(25.0, r["call_iv"] + random.uniform(-0.4,0.4))),1)
-        r["put_iv"]   = round(max(9.0, min(25.0, r["put_iv"]  + random.uniform(-0.4,0.4))),1)
-        r["call_delta"]= round(min(0.99,max(0.01, 0.5+dist/500)),2)
-        r["put_delta"] = round(min(-0.01,max(-0.99,-0.5+dist/500)),2)
-    return rows
+def update_option_chain(rows: list, spot: float, expiry: str | None = None) -> list:
+    """Refresh the option chain from live provider data only.
+    No mock drift — if the live fetch fails, the previous rows are kept
+    as-is until the next successful fetch."""
+    fresh = _fetch_live_chain(spot, expiry)
+    return fresh if fresh else rows
 
 
 def render_option_chain(rows: list, opt_type: str) -> str:
+    if not rows:
+        status = get_status()
+        reason = status.get("reason")
+        reason_msg = {
+            "auth_expired": "Access token has expired — regenerate UPSTOX_ACCESS_TOKEN.",
+            "no_token":     "No access token configured — check private.env.",
+            "network_error":"Network error reaching the data provider.",
+            "http_error":   "Data provider returned an error.",
+        }.get(reason, "No live option chain data available yet.")
+        return (f'<div style="padding:24px 16px;text-align:center;color:#787B86;font-size:12px;">'
+                f'{reason_msg}</div>')
+
     show_c = opt_type in ("ALL","CALL")
     show_p = opt_type in ("ALL","PUT")
 
@@ -475,6 +438,10 @@ html { height:100%; overflow:hidden; }
 .tv-chain-tab.active.tab-all { background:#2962FF; }
 .tv-chain-tab.active.tab-call { background:#26A69A; }
 .tv-chain-tab.active.tab-put { background:#EF5350; }
+.tv-expiry-tabs { display:flex; gap:6px; padding:8px 12px; border-bottom:1px solid #2A2E39; background:#1E222D; overflow-x:auto; }
+.tv-expiry-tab { flex-shrink:0; padding:5px 10px; font-size:10px; font-weight:600; letter-spacing:.02em; border-radius:4px; cursor:pointer; color:#787B86; background:#131722; transition:background .15s,color .15s; user-select:none; white-space:nowrap; }
+.tv-expiry-tab:hover { background:#2A2E39; color:#D1D4DC; }
+.tv-expiry-tab.active { color:#fff; background:#2962FF; }
 .tv-chain-scroll { flex:1; overflow-y:auto; overflow-x:hidden; }
 .tv-chain-table { width:100%; border-collapse:collapse; font-size:11px; }
 .tv-chain-table thead th { position:sticky; top:0; background:#1E222D; color:#787B86; font-weight:600; font-size:9px; text-transform:uppercase; letter-spacing:.04em; padding:7px 5px; border-bottom:1px solid #2A2E39; text-align:right; z-index:5; }
@@ -588,7 +555,7 @@ def login_page():
             err = ui.label("").classes("tv-login-error")
             def do_login():
                 if pwd.value == PASSWORD:
-                    # FIX: per-browser-session flag instead of a shared module
+                    # per-browser-session flag instead of a shared module
                     # global — otherwise one person logging in unlocks the
                     # dashboard for every visitor.
                     app.storage.user["logged_in"] = True
@@ -605,7 +572,7 @@ def login_page():
 # ─────────────────────────────────────────────────────────────────────────
 @ui.page("/dashboard")
 def dashboard():
-    # FIX: check per-session storage instead of a shared global bool.
+    # check per-session storage instead of a shared global bool.
     if not app.storage.user.get("logged_in"):
         ui.navigate.to("/")
         return
@@ -620,12 +587,15 @@ def dashboard():
 
     init_live_state()
 
+    expiries = get_expiries()  # all available expiry dates, ascending
     state = {
         "bar_id":      0,
         "tf":          DEFAULT_TF,
         "option_type": "ALL",
         "conviction":  None,
-        "chain_rows":  make_option_chain(live_state["spot"] or 24892),
+        "expiries":        expiries,
+        "selected_expiry": expiries[0] if expiries else None,  # None = provider's nearest-expiry default
+        "chain_rows":  make_option_chain(live_state["spot"] or 24892, expiries[0] if expiries else None),
     }
     refs = {}
 
@@ -699,43 +669,75 @@ def dashboard():
             refs[f"tf_{t}"].set_content(f'<button class="{cls}" style="background:none;border:none;cursor:pointer;font-family:Inter,sans-serif;font-size:12px;padding:3px 7px;border-radius:3px;color:{"#fff" if t==tf else "#787B86"};{"background:#2962FF;" if t==tf else ""}">{t}</button>')
 
     # ── option chain ─────────────────────────────────────────────────────
+    def _fmt_expiry_label(exp: str) -> str:
+        try:
+            return datetime.strptime(exp, "%Y-%m-%d").strftime("%d %b")
+        except Exception:
+            return exp
+
     def render_chain_and_tabs():
         refs["chain_table"].set_content(render_option_chain(state["chain_rows"], state["option_type"]))
         for code in ("ALL","CALL","PUT"):
             lab = {"ALL":"All","CALL":"Call (CE)","PUT":"Put (PE)"}[code]
             cls = f"tv-chain-tab tab-{code.lower()}" + (" active" if code==state["option_type"] else "")
             refs[f"tab_{code}"].set_content(f'<div class="{cls}">{lab}</div>')
+
+        # Expiry row — one tappable pill per available expiry date. Both
+        # calls and puts come from the same get_option_chain(expiry_date=...)
+        # payload, so a single selector drives both sides of the table.
+        refs["expiry_tabs_box"].clear()
+        with refs["expiry_tabs_box"]:
+            if not state["expiries"]:
+                ui.html('<span style="font-size:10px;color:#787B86;padding:4px 0;">No expiries loaded</span>')
+            for exp in state["expiries"]:
+                active = exp == state["selected_expiry"]
+                cls = "tv-expiry-tab active" if active else "tv-expiry-tab"
+                btn = ui.html(f'<div class="{cls}">{_fmt_expiry_label(exp)}</div>')
+                btn.on("click", lambda e=exp: select_expiry(e))
+
         spot = live_state["spot"] or 24892
         refs["chain_footer_spot"].set_content(f'<span>Spot {spot:,.1f}</span>')
+        exp_label = _fmt_expiry_label(state["selected_expiry"]) if state["selected_expiry"] else "—"
+        refs["sidebar_header"].set_content(
+            f'<div class="tv-sidebar-header">Option Chain'
+            f'<span class="tv-sidebar-sub">{SYMBOL} · {exp_label}</span></div>'
+        )
 
     def select_option(code: str):
         state["option_type"] = code
         render_chain_and_tabs()
         refresh_signal_panel()
 
-    def refresh_chain():
-        """Refresh the option-chain sidebar.
-        While NSE is open: mock mode drifts smoothly tick-to-tick, and if a
-        real Upstox chain endpoint is wired in, that's refetched every tick.
-        While NSE is closed: skip the random walk entirely so mock data
-        freezes at its last value; still try a real Upstox fetch (which will
-        itself just keep returning the last traded closing quotes)."""
+    def select_expiry(exp: str):
+        state["selected_expiry"] = exp
         spot = live_state["spot"] or 24892
+        state["chain_rows"] = make_option_chain(spot, exp)
+        render_chain_and_tabs()
+        refresh_signal_panel()
+
+    def refresh_chain():
+        """Refresh the option-chain sidebar from live provider data only,
+        for whichever expiry is currently selected. While NSE is closed,
+        still attempt a fetch (the provider will just keep returning the
+        last traded closing quotes); if it fails, the panel keeps showing
+        whatever it last had (or the empty-state message) rather than
+        fabricating data."""
+        spot = live_state["spot"] or 24892
+        exp = state["selected_expiry"]
 
         if not is_market_open():
-            if UPSTOX_CHAIN_AVAILABLE:
-                fresh = _fetch_upstox_chain(spot)
-                if fresh:
-                    state["chain_rows"] = fresh
+            fresh = _fetch_live_chain(spot, exp)
+            if fresh:
+                state["chain_rows"] = fresh
             render_chain_and_tabs()
             return
 
         current_atm = round(state["chain_rows"][len(state["chain_rows"])//2]["strike"]/STRIKE_STEP)*STRIKE_STEP if state["chain_rows"] else None
         new_atm = round(spot/STRIKE_STEP)*STRIKE_STEP
         if current_atm is None or new_atm != current_atm:
-            state["chain_rows"] = make_option_chain(spot)
+            state["chain_rows"] = make_option_chain(spot, exp)
         else:
-            state["chain_rows"] = update_option_chain(state["chain_rows"], spot)
+            state["chain_rows"] = update_option_chain(state["chain_rows"], spot, exp)
         render_chain_and_tabs()
 
     # ── 2-second master refresh ──────────────────────────────────────────
@@ -753,10 +755,17 @@ def dashboard():
             state["bar_id"] += 1
         refresh_signal_panel()
         refresh_chain()
-        # keep the API-status badge in the top bar honest
+        # keep the API-status badge in the top bar honest, and specific
+        # about *why* it's down when it is (auth expired vs network vs...)
         ok = live_state.get("api_ok", True)
+        reason = live_state.get("api_reason")
+        label = "API LIVE" if ok else {
+            "auth_expired": "TOKEN EXPIRED",
+            "no_token":     "NO TOKEN SET",
+            "network_error":"NETWORK ERROR",
+        }.get(reason, "API DOWN · MOCK")
         refs["api_badge"].set_content(
-            f'<span class="tv-api-badge {"tv-api-ok" if ok else "tv-api-down"}">{"API LIVE" if ok else "API DOWN · MOCK"}</span>'
+            f'<span class="tv-api-badge {"tv-api-ok" if ok else "tv-api-down"}">{label}</span>'
         )
 
     ui.timer(2.0, refresh_all)
@@ -809,7 +818,20 @@ def dashboard():
 
         # LEFT — option chain
         with ui.element("div").classes("tv-sidebar"):
-            ui.html(f'<div class="tv-sidebar-header">Option Chain<span class="tv-sidebar-sub">{SYMBOL} · Weekly</span></div>')
+            refs["sidebar_header"] = ui.html(
+                f'<div class="tv-sidebar-header">Option Chain'
+                f'<span class="tv-sidebar-sub">{SYMBOL} · '
+                f'{_fmt_expiry_label(state["selected_expiry"]) if state["selected_expiry"] else "—"}</span></div>'
+            )
+            # Expiry-date row — same call/put payload just re-fetched for
+            # whichever expiry is selected here (see select_expiry above).
+            refs["expiry_tabs_box"] = ui.row().classes("tv-expiry-tabs").style("gap:6px;flex-wrap:nowrap;")
+            with refs["expiry_tabs_box"]:
+                for exp in state["expiries"]:
+                    active = exp == state["selected_expiry"]
+                    cls = "tv-expiry-tab active" if active else "tv-expiry-tab"
+                    btn = ui.html(f'<div class="{cls}">{_fmt_expiry_label(exp)}</div>')
+                    btn.on("click", lambda e=exp: select_expiry(e))
             with ui.element("div").classes("tv-chain-tabs"):
                 for code in ("ALL","CALL","PUT"):
                     lab = {"ALL":"All","CALL":"Call (CE)","PUT":"Put (PE)"}[code]
@@ -854,12 +876,6 @@ def dashboard():
                     refs[f"tf_{tf}"] = btn
 
             with ui.element("div").classes("tv-chart-wrap"):
-                # NOTE: ui.plotly has no `.options` attribute — that was
-                # invalid API and raised `AttributeError: 'plotly' object
-                # has no attribute 'options'`. NiceGUI's ui.plotly just
-                # renders the go.Figure you give it; Plotly JS config flags
-                # like displaylogo/scrollZoom aren't exposed through a
-                # Python setter here, so they're dropped rather than faked.
                 refs["plot"] = ui.plotly(make_candlestick()).style("width:100%;height:100%")
 
             refs["stat_bar"] = ui.html('<div class="tv-stat-bar"><div class="tv-stat-item"><span class="tv-stat-label">Loading...</span></div></div>')
