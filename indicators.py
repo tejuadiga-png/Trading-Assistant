@@ -1,10 +1,10 @@
 import numpy as np
 import pandas as pd
 
-    def ema(close, period):
-        """Exponential Moving Average.Parametersclose : pd.Seriesperiod : int Returns pd.Series """
-        close = pd.Series(close)
-        return close.ewm(span=period, adjust=False).mean()
+def ema(close, period):
+    """Exponential Moving Average.Parametersclose : pd.Seriesperiod : int Returns pd.Series """
+    close = pd.Series(close)
+    return close.ewm(span=period, adjust=False).mean()
 
 def sma(close, period):
     """Simple Moving Average."""

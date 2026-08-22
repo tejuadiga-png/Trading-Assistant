@@ -7,6 +7,8 @@ from datetime import datetime, timedelta
 import pytz
 
 from upstox import get_live_nifty, get_historical_nifty, get_option_chain, get_expiries, get_status
+from pipeline_adapter import compute_conviction_real
+from options_risk import build_option_trade_plan
 
 # ─────────────────────────────────────────────────────────────────────────
 # NSE / Nifty config
@@ -14,7 +16,7 @@ from upstox import get_live_nifty, get_historical_nifty, get_option_chain, get_e
 IST = pytz.timezone("Asia/Kolkata")
 PASSWORD    = os.getenv("DASHBOARD_PASSWORD", "model2026")
 SYMBOL      = "NIFTY 50"
-NIFTY_LOT   = 75          # update per NSE circular
+NIFTY_LOT   = 65          # revised from 75 -> 65 effective Jan 2026 expiry series -- update per NSE circular
 STRIKE_STEP = 50
 CHAIN_WIDTH = 10          # strikes above & below ATM
 
@@ -30,11 +32,19 @@ TF_MAP = {
 DEFAULT_TF = "5m"
 
 def is_market_open() -> bool:
+    """NSE equity F&O (index options, incl. Nifty) trading window.
+    Extended 10 min effective 3 Aug 2026 -> now closes 15:40, not 15:30.
+    NOTE: this does NOT apply the new 3:15 PM Closing Auction Session
+    cutoff -- CAS only affects the ~200 individual F&O-eligible STOCKS'
+    cash-market close, not the index derivatives segment this bot
+    trades. Nifty/BankNifty index options still trade continuously
+    through 15:40, no auction window.
+    Also doesn't yet account for NSE holidays -- still a known gap."""
     now = datetime.now(IST)
     if now.weekday() >= 5:
         return False
     o = now.replace(hour=9,  minute=15, second=0, microsecond=0)
-    c = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    c = now.replace(hour=15, minute=40, second=0, microsecond=0)
     return o <= now <= c
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -197,7 +207,10 @@ DISPERSION_PENALTY = 0.8
 def mock_market_state(symbol: str, bar_id: int = 0) -> dict:
     """Deterministic per (symbol, bar_id) — same bar always gives same reading.
     Order-flow/OI/FII-DII fields are still simulated until a real
-    options-analytics endpoint is wired into a provider."""
+    options-analytics endpoint is wired into a provider.
+    Used as the baseline/fallback source by real_market_state() in
+    market_state_bridge.py — every field here gets overwritten with a
+    real computed value where a detector module exists."""
     rng = random.Random(f"{symbol}-{bar_id}")
     return {
         "trend_aligned":          rng.random() > 0.3,
@@ -222,8 +235,12 @@ def _direction(s: dict):
     return None
 
 
-def compute_conviction(symbol: str, bar_id: int = 0) -> dict:
-    s = mock_market_state(symbol, bar_id)
+def compute_conviction_mock(symbol: str, bar_id: int = 0) -> dict:
+    """Fallback engine — mock_market_state()-based. Used only if the real
+    regime.run_pipeline() engine raises (e.g. insufficient candle history
+    right after market open)."""
+    from market_state_bridge import real_market_state
+    s = real_market_state(symbol, bar_id, live_state["candles"])
     reasons = []
     chop = s["adx"] < CHOP_ADX_VETO or s["range_compression"] < 0.4
 
@@ -272,6 +289,18 @@ def compute_conviction(symbol: str, bar_id: int = 0) -> dict:
 
     return {"score":score,"verdict":verdict,"verdict_color":vc,
             "direction":direction or "-","reasons":reasons,"raw":s,"chop":chop}
+
+
+def compute_conviction(symbol: str, bar_id: int = 0) -> dict:
+    """Primary engine — regime.run_pipeline() (news filter -> regime
+    filter -> strategy -> conviction -> signal -> trade levels), reshaped
+    to this dict's shape by pipeline_adapter.py. Falls back to the mock
+    scorer on any failure so the UI never crashes."""
+    try:
+        return compute_conviction_real(symbol, bar_id, live_state["candles"])
+    except Exception as e:
+        print(f"[compute_conviction] real pipeline failed, falling back to mock: {e}")
+        return compute_conviction_mock(symbol, bar_id)
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -772,9 +801,6 @@ def dashboard():
 
     # ── trade calculator ─────────────────────────────────────────────────
     def do_calc():
-        ev = refs["entry"].value
-        if not ev:
-            return
         conv = state.get("conviction")
         if conv and conv.get("chop"):
             refs["target_lbl"].set_content('<div style="font-size:11px;color:#EF5350;padding:4px 0">Market is choppy — trade not recommended.</div>')
@@ -786,17 +812,55 @@ def dashboard():
             refs["sl_lbl"].set_content("<div></div>")
             refs["rr_lbl"].set_content("<div></div>")
             return
+
         opt = state["option_type"]
         direction = "LONG" if opt=="CALL" else "SHORT" if opt=="PUT" else (conv["direction"] if conv else "LONG")
-        risk   = round(float(ev)*0.003, 1)
-        score  = conv["score"] if conv else "—"
-        if direction=="SHORT":
-            tgt,sl,tc,sc = round(float(ev)-3*risk,1), round(float(ev)+risk,1), "#EF5350","#26A69A"
-        else:
-            tgt,sl,tc,sc = round(float(ev)+3*risk,1), round(float(ev)-risk,1), "#26A69A","#EF5350"
-        refs["target_lbl"].set_content(f'<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span style="color:#787B86">Target</span><span style="color:{tc};font-weight:600">{tgt}</span></div>')
-        refs["sl_lbl"].set_content(f'<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0"><span style="color:#787B86">Stop Loss</span><span style="color:{sc};font-weight:600">{sl}</span></div>')
-        refs["rr_lbl"].set_content(f'<div style="font-size:10px;color:#787B86;margin-top:4px;padding:6px 8px;background:#131722;border-radius:4px;">Risk {risk} pts &middot; \u20b9{risk*NIFTY_LOT:,.0f}/lot (lot={NIFTY_LOT}) &middot; 1:3 R:R &middot; Conviction {score}%</div>')
+        signal = conv.get("verdict") if conv else "WATCH"
+        # verdict is "TRADE"/"WATCH"/"NO TRADE" in the UI's shape --
+        # build_option_trade_plan wants strategy.py's signal vocabulary
+        # (STRONG BUY/BUY/etc) for its conviction-scaled target sizing;
+        # fall back to a plain BUY/SELL since that's all this dict has.
+        pipeline_signal = "BUY" if direction == "LONG" else "SELL"
+
+        capital = refs["capital_input"].value
+        risk_pct = refs["risk_pct_input"].value
+        if not capital or not risk_pct:
+            refs["target_lbl"].set_content('<div style="font-size:11px;color:#F59E0B;padding:4px 0">Enter capital and risk % below to size the trade.</div>')
+            refs["sl_lbl"].set_content("<div></div>")
+            refs["rr_lbl"].set_content("<div></div>")
+            return
+
+        plan = build_option_trade_plan(direction, pipeline_signal, state["chain_rows"],
+                                        float(capital), float(risk_pct), lot_size=NIFTY_LOT)
+        if not plan:
+            refs["target_lbl"].set_content('<div style="font-size:11px;color:#EF5350;padding:4px 0">No live option chain data to size a trade against.</div>')
+            refs["sl_lbl"].set_content("<div></div>")
+            refs["rr_lbl"].set_content("<div></div>")
+            return
+        if plan["warning"]:
+            refs["target_lbl"].set_content(f'<div style="font-size:11px;color:#F59E0B;padding:4px 0">{plan["warning"]}</div>')
+            refs["sl_lbl"].set_content("<div></div>")
+            refs["rr_lbl"].set_content("<div></div>")
+            return
+
+        lv, sz, cost = plan["levels"], plan["sizing"], plan["cost_estimate"]
+        tc, sc = ("#26A69A","#EF5350") if direction != "SHORT" else ("#26A69A","#EF5350")
+        refs["target_lbl"].set_content(
+            f'<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">'
+            f'<span style="color:#787B86">{plan["side"]} {int(plan["strike"])} Target</span>'
+            f'<span style="color:{tc};font-weight:600">\u20b9{lv["target_premium"]}</span></div>'
+        )
+        refs["sl_lbl"].set_content(
+            f'<div style="display:flex;justify-content:space-between;font-size:12px;padding:3px 0">'
+            f'<span style="color:#787B86">Stop Loss</span>'
+            f'<span style="color:{sc};font-weight:600">\u20b9{lv["stop_loss_premium"]}</span></div>'
+        )
+        refs["rr_lbl"].set_content(
+            f'<div style="font-size:10px;color:#787B86;margin-top:4px;padding:6px 8px;background:#131722;border-radius:4px;">'
+            f'Entry \u20b9{lv["entry_premium"]} &middot; {sz["lots"]} lot(s) &middot; '
+            f'Max loss \u20b9{sz["max_loss_at_lots"]:,.0f} &middot; 1:{lv["risk_reward"]} R:R &middot; '
+            f'Est. costs \u20b9{cost["total_cost"]:,.0f}</div>'
+        )
 
     # ── TOP BAR ──────────────────────────────────────────────────────────
     with ui.element("div").classes("tv-topbar"):
@@ -898,8 +962,10 @@ def dashboard():
 
             with ui.element("div").classes("tv-panel-section"):
                 ui.html('<div class="tv-panel-section-title">Trade Calculator</div>')
-                refs["entry"] = ui.number(label="Entry Price",placeholder="e.g. 24850").classes("w-full").props("outlined dark color=blue-5 dense")
-                refs["entry"].style("margin-bottom:6px")
+                refs["capital_input"] = ui.number(label="Capital (\u20b9)",placeholder="e.g. 100000").classes("w-full").props("outlined dark color=blue-5 dense")
+                refs["capital_input"].style("margin-bottom:6px")
+                refs["risk_pct_input"] = ui.number(label="Risk % per trade",placeholder="e.g. 2").classes("w-full").props("outlined dark color=blue-5 dense")
+                refs["risk_pct_input"].style("margin-bottom:6px")
                 refs["target_lbl"] = ui.html('<div style="font-size:12px;color:#787B86;padding:3px 0">Target: &mdash;</div>')
                 refs["sl_lbl"]     = ui.html('<div style="font-size:12px;color:#787B86;padding:3px 0">Stop Loss: &mdash;</div>')
                 refs["rr_lbl"]     = ui.html('<div></div>')
