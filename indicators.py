@@ -1,6 +1,5 @@
 import numpy as np
 import pandas as pd
-
 def ema(close, period):
     """Exponential Moving Average.Parametersclose : pd.Seriesperiod : int Returns pd.Series """
     close = pd.Series(close)
