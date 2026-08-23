@@ -1,4 +1,3 @@
-#strategy
 """
 strategy.py — the conviction-scoring pipeline:
 
@@ -35,11 +34,11 @@ so you can change them):
     exact tier cutoffs/points are my read of your example — adjust freely.
   * Sweep recency decay: a bullish/bearish sweep confirmed further back
     scores less than a fresh one, via SWEEP_RECENCY_TIERS (currently
-    <=3 bars -> 20, <=6 bars -> 12, <=10 bars -> 6, else 0). This needs
-    the sweep's *age in bars*, which signals.latest_sweep_state() doesn't
-    report (it only tells you if the very last bar swept). So I added
-    compute_liquidity_state() below, which scans back through the full
-    sweep history and reports `bars_since_sweep`. If you still pass in
+    <=3 bars -> 20, <=5 bars -> 10, else 0). This needs the sweep's
+    *age in bars*, which signals.latest_sweep_state() doesn't report
+    (it only tells you if the very last bar swept). So compute_
+    liquidity_state() below scans back through the full sweep history
+    and reports `bars_since_sweep`. If you still pass in
     signals.latest_sweep_state()'s shape (no age field), evaluate_setup
     falls back to treating it as freshest (full points) — flagged as a
     compatibility shim, not a real recency read.
@@ -56,6 +55,38 @@ so you can change them):
     takes `last_close` as its own argument for the Near-VAL/VAH checks.
   * _print_dashboard() has been removed per your request — build_dashboard()
     now only returns data, it doesn't print anything.
+
+  * VOLUME GATE — DISABLED, not deleted (see VOLUME_GATE_ENABLED below).
+    A hard volume gate (zero both scores when current-bar volume falls
+    below MIN_VOLUME_RATIO of its rolling average) was added during the
+    mock-vs-real pipeline merge as an "institutional-grade tightening."
+    It was wrong on two counts, both now documented here instead of
+    silently fixed:
+      1. Volume-price relationship is direction-dependent. A healthy
+         uptrend often pulls back on LOW volume (contraction on the
+         corrective leg is normal, not weak) while expanding on the
+         impulse leg — a single "volume must be >= X% of average"
+         threshold applied identically to both LONG and SHORT setups
+         systematically penalizes legitimate low-volume continuation
+         setups on one side or the other, depending on which phase of
+         the trend you're in. Fixing this properly needs a
+         direction-aware rule (e.g. volume expanding *in the direction
+         of the setup*), not a single symmetric floor.
+      2. The instrument this trades (Nifty 50) is a computed index, not
+         a directly tradable security — whatever Upstox returns in an
+         index candle's volume field may be a proxy, may be zero, or
+         may not be comparable to a 20-bar rolling average the way real
+         traded volume would be. This gate was only ever tested against
+         synthetic random volume data; it was never verified against
+         what Upstox's actual index candle response contains.
+    Given both problems, VOLUME_GATE_ENABLED defaults to False:
+    volume_ratio/volume_ok are still computed and returned in
+    get_market_strength()'s output (so you can inspect real values
+    against live Upstox data before trusting them), but compute_conviction()
+    no longer zeroes scores based on them. Flip VOLUME_GATE_ENABLED to
+    True only after (a) confirming Upstox's Nifty index candles carry a
+    meaningful, non-zero volume field, and (b) replacing the single
+    MIN_VOLUME_RATIO floor with a direction-aware check.
 """
 from __future__ import annotations
 import pandas as pd
@@ -67,9 +98,6 @@ from liquidity_sweeps import detect_liquidity_sweeps
 # Config — tune all thresholds/weights here, nowhere else in the file
 # ---------------------------------------------------------------------
 
-# Flat-weight conditions only. Near-VAL/VAH and sweep points are graduated
-# (see NEAR_LEVEL_SCORE_TIERS / SWEEP_RECENCY_TIERS) — their max points
-# (15 and 20) still add up to the same 100-point ceiling.
 WEIGHTS_LONG = {
     "daily_trend_bullish": 25,
     "h4_trend_bullish": 20,
@@ -97,26 +125,50 @@ TREND_STRENGTH_BANDS = {
 
 SIGNAL_THRESHOLDS = {
     "STRONG": 80,
-    "ACTIVE": 60,
+    "ACTIVE": 55,
 }  # below ACTIVE on both sides -> WATCH
 
-# Distance tiers for Near-VAL / Near-VAH, tightest first. Each tuple is
-# (max_distance_pct_as_fraction, points). First tier whose threshold the
-# actual distance falls within wins; beyond the last tier -> 0 points.
+# Institutional-grade tightening (reduce trade frequency, raise setup
+# quality) — added after the mock-vs-real pipeline merge:
+MIN_SCORE_MARGIN = 10
+# Below this gap between long_score and short_score, the two sides are
+# too close to call — treat as genuinely ambiguous and force WATCH,
+# rather than picking whichever is marginally higher (a near-tie is not
+# a directional edge). Lowered from 15 alongside SIGNAL_THRESHOLDS["ACTIVE"]
+# dropping to 55, so a 55 doesn't get vetoed just because the opposite
+# side scored in the high 40s — still forces WATCH on genuine near-ties
+# (e.g. 60 vs 58).
+
+TREND_GATE_REQUIRED = True
+# Hard requirement: without daily OR 4H trend alignment in a side's
+# direction, that side's score is zeroed regardless of how many other
+# points it accumulated. Previously a LONG could reach 55+ points from
+# sweep+near_val+adx+rsi alone with ZERO trend confirmation — that is a
+# coincidence of secondary signals, not a trend-following setup, and
+# was the single biggest quality gap in the original scoring.
+
+VOLUME_GATE_ENABLED = False
+# DISABLED — see the "VOLUME GATE" section of the module docstring for
+# why. volume_ratio/volume_ok are still computed below for visibility,
+# they just aren't used to zero scores until verified against real
+# Upstox index-candle data and made direction-aware.
+MIN_VOLUME_RATIO = 0.8
+# Current-bar volume must be at least this fraction of its
+# VOLUME_LOOKBACK-bar rolling average — unused while VOLUME_GATE_ENABLED
+# is False; kept as the starting point for whoever re-enables this.
+VOLUME_LOOKBACK = 20
+
 NEAR_LEVEL_SCORE_TIERS = [
     (0.0005, 15),  # within 0.05%
     (0.0015, 10),  # within 0.15%
     (0.0030, 5),   # within 0.30%
 ]
 
-# Recency tiers for a confirmed sweep, freshest first. Each tuple is
-# (max_age_in_bars, points). Beyond the last tier -> 0 points (too stale
-# to count as a live liquidity grab).
 SWEEP_RECENCY_TIERS = [
     (3, 20),   # swept within the last 3 bars
-    (6, 12),   # within 6 bars
-    (10, 6),   # within 10 bars
-]
+    (5, 10),   # within 5 bars
+]  # tightened from a 3-tier/10-bar decay -- a 6-10-bar-old sweep is
+   # stale liquidity for a strength-following entry, not an active setup
 
 RISK_REWARD_RATIO = 2.0      # target distance = risk distance * this multiple
 STOP_ATR_MULT = 1.5          # fallback stop distance (in ATRs) when no swept_level is available
@@ -128,9 +180,6 @@ STOP_BUFFER_ATR_MULT = 0.25  # extra buffer beyond a structural swept_level, in 
 # ---------------------------------------------------------------------
 
 def _is_rising(series: pd.Series, lookback: int = EMA_SLOPE_LOOKBACK) -> bool:
-    """True if the series' latest value is higher than it was `lookback`
-    bars ago. Used to confirm an EMA is actually sloping up, not just
-    sitting above another EMA."""
     if len(series) <= lookback:
         return False
     return bool(series.iloc[-1] > series.iloc[-1 - lookback])
@@ -148,18 +197,10 @@ def get_higher_timeframe_trend(daily_df: pd.DataFrame, h4_df: pd.DataFrame) -> d
         EMA20 > EMA50 AND Close > EMA20 AND EMA20 rising AND EMA50 rising
     Bearish conditions mirror this with < and falling.
 
-    "Rising"/"falling" replaces a plain EMA20 > EMA50 snapshot check —
-    both EMAs must actually be sloping in the trend's direction, not
-    just positioned correctly at this instant.
-
-    Returns a dict meant to be displayed on the dashboard as-is, with
-    both the raw values and the booleans derived from them.
-
     NOTE: `trend_bullish` / `trend_bearish` (the combined AND of both
     timeframes) are dashboard-display-only. evaluate_setup scores
     daily_trend_bullish and h4_trend_bullish independently with their
-    own weights — it does NOT read these combined fields — so a single
-    out-of-alignment timeframe only costs its own points.
+    own weights — it does NOT read these combined fields.
     """
     d_close = daily_df["close"]
     h_close = h4_df["close"]
@@ -203,7 +244,6 @@ def get_higher_timeframe_trend(daily_df: pd.DataFrame, h4_df: pd.DataFrame) -> d
         "h4_ema50_rising": _is_rising(h_ema50),
         "h4_trend_bullish": h4_bullish,
         "h4_trend_bearish": h4_bearish,
-        # Dashboard-display-only combined view — NOT used in scoring:
         "trend_bullish": daily_bullish and h4_bullish,
         "trend_bearish": daily_bearish and h4_bearish,
     }
@@ -217,6 +257,10 @@ def get_market_strength(df: pd.DataFrame) -> dict:
     """
     Calculates ADX, RSI, ATR off the given dataframe (needs high/low/close)
     and returns e.g. {"adx": 27, "rsi": 58, "atr": 12.4, "trend_strength": "STRONG"}
+
+    volume_ratio/volume_ok are computed for visibility only — see the
+    "VOLUME GATE" note in the module docstring for why they're not used
+    to gate scoring right now (VOLUME_GATE_ENABLED = False).
     """
     adx_val = float(adx(df["high"], df["low"], df["close"]).iloc[-1])
     rsi_val = float(rsi(df["close"]).iloc[-1])
@@ -229,11 +273,22 @@ def get_market_strength(df: pd.DataFrame) -> dict:
     else:
         label = "WEAK"
 
+    volume_ok = True
+    volume_ratio = None
+    if "volume" in df.columns and len(df) > VOLUME_LOOKBACK:
+        avg_vol = float(df["volume"].iloc[-(VOLUME_LOOKBACK + 1):-1].mean())
+        cur_vol = float(df["volume"].iloc[-1])
+        if avg_vol > 0:
+            volume_ratio = round(cur_vol / avg_vol, 3)
+            volume_ok = volume_ratio >= MIN_VOLUME_RATIO
+
     return {
         "adx": round(adx_val, 2),
         "rsi": round(rsi_val, 2),
         "atr": round(atr_val, 4),
         "trend_strength": label,
+        "volume_ratio": volume_ratio,   # None if no volume column / not enough history
+        "volume_ok": volume_ok,         # informational only — see VOLUME_GATE_ENABLED
     }
 
 
@@ -248,9 +303,6 @@ def _distance_pct(price: float, level: float) -> float | None:
 
 
 def _score_proximity(distance_pct: float | None, tiers=NEAR_LEVEL_SCORE_TIERS) -> int:
-    """Graduated score: the first tier whose threshold the distance falls
-    within wins (tiers must be sorted tightest-first). Beyond every tier
-    -> 0."""
     if distance_pct is None:
         return 0
     for max_distance, points in tiers:
@@ -302,7 +354,6 @@ def compute_liquidity_state(df: pd.DataFrame, left_bars: int = 3, right_bars: in
     if latest_bull is None and latest_bear is None:
         return {"sweep_confirmed": False, "direction": None, "swept_level": None, "bars_since_sweep": None}
 
-    # Pick whichever sweep happened most recently.
     if latest_bull is not None and (latest_bear is None or latest_bull >= latest_bear):
         idx, direction = latest_bull, "bullish"
     else:
@@ -317,14 +368,6 @@ def compute_liquidity_state(df: pd.DataFrame, left_bars: int = 3, right_bars: in
 
 
 def _score_sweep_recency(liquidity: dict, expected_direction: str, tiers=SWEEP_RECENCY_TIERS) -> dict:
-    """
-    Scores a confirmed sweep in `expected_direction` ("bullish" or
-    "bearish") by how many bars old it is. If `liquidity` doesn't carry
-    a `bars_since_sweep` field (e.g. it came from signals.latest_sweep_state(),
-    which only reports the current bar), this falls back to treating a
-    confirmed sweep as maximally fresh — a compatibility shim, not a
-    real recency read.
-    """
     confirmed = bool(liquidity.get("sweep_confirmed")) and liquidity.get("direction") == expected_direction
     if not confirmed:
         return {"points": 0, "bars_since_sweep": None}
@@ -351,17 +394,6 @@ def evaluate_setup(trend: dict, strength: dict, liquidity: dict, volume_profile:
             "long":  {condition_name: {"met": bool, "points": int, ...}, ...},
             "short": {condition_name: {"met": bool, "points": int, ...}, ...},
         }
-
-    Long scoring:
-        Daily Trend Bullish (EMA20>EMA50, Close>EMA20, both rising)  +25
-        4H Trend Bullish (same, 4H)                                  +20
-        Bullish Sweep, decayed by recency                            up to +20
-        Near VAL, decayed by distance                                up to +15
-        ADX > 25                                                     +10
-        RSI between 50-70                                            +10
-
-    Short scoring mirrors this: Daily/4H Trend Bearish, Bearish Sweep,
-    Near VAH, ADX > 25, RSI between 30-50.
     """
     rsi_val = strength.get("rsi", 0)
     adx_strong = strength.get("adx", 0) > ADX_STRONG_THRESHOLD
@@ -405,14 +437,47 @@ def evaluate_setup(trend: dict, strength: dict, liquidity: dict, volume_profile:
 # 4. Conviction scoring
 # ---------------------------------------------------------------------
 
-def compute_conviction(setup: dict) -> dict:
+def compute_conviction(setup: dict, strength: dict | None = None) -> dict:
     """Sums the itemized points from evaluate_setup() into two scores:
         {"long_score": int, "short_score": int}   (each 0-100)
+
+    Applies one hard gate on top of the raw sum (see TREND_GATE_REQUIRED
+    in the config section):
+
+      Trend gate: a side scores 0 unless its daily OR 4H trend condition
+      is met — no longer possible to reach a tradeable score from
+      secondary signals (sweep/near-level/adx/rsi) alone with zero trend
+      confirmation.
+
+    A second gate — zeroing both scores when strength["volume_ok"] is
+    False — previously lived here too and has been DISABLED (see the
+    "VOLUME GATE" section of the module docstring): it applied a single
+    symmetric volume floor to both directions despite volume-price
+    relationships being direction-dependent, and was never verified
+    against what Upstox's Nifty 50 index candles actually report for
+    volume. `strength` is still accepted here (and volume_ratio/volume_ok
+    are still computed in get_market_strength()) so re-enabling it later
+    — behind VOLUME_GATE_ENABLED, once verified — doesn't need a new
+    function signature.
     """
-    return {
-        "long_score": sum(item["points"] for item in setup["long"].values()),
-        "short_score": sum(item["points"] for item in setup["short"].values()),
-    }
+    long_score = sum(item["points"] for item in setup["long"].values())
+    short_score = sum(item["points"] for item in setup["short"].values())
+
+    if TREND_GATE_REQUIRED:
+        long_trend_ok = setup["long"].get("daily_trend_bullish", {}).get("met") or \
+                         setup["long"].get("h4_trend_bullish", {}).get("met")
+        short_trend_ok = setup["short"].get("daily_trend_bearish", {}).get("met") or \
+                          setup["short"].get("h4_trend_bearish", {}).get("met")
+        if not long_trend_ok:
+            long_score = 0
+        if not short_trend_ok:
+            short_score = 0
+
+    if VOLUME_GATE_ENABLED and strength is not None and not strength.get("volume_ok", True):
+        long_score = 0
+        short_score = 0
+
+    return {"long_score": long_score, "short_score": short_score}
 
 
 # ---------------------------------------------------------------------
@@ -420,16 +485,15 @@ def compute_conviction(setup: dict) -> dict:
 # ---------------------------------------------------------------------
 
 def generate_signal(scores: dict) -> str:
-    """
-    Picks the dominant side (higher of long_score / short_score) and
-    maps it to a 5-tier signal:
-        score >= 80  -> STRONG BUY  / STRONG SELL
-        score 60-79  -> BUY         / SELL
-        below 60 on both sides -> WATCH
-    """
     long_score = scores.get("long_score", 0)
     short_score = scores.get("short_score", 0)
     strong, active = SIGNAL_THRESHOLDS["STRONG"], SIGNAL_THRESHOLDS["ACTIVE"]
+
+    # Ambiguity gate: if the two sides are within MIN_SCORE_MARGIN of
+    # each other, this isn't a directional edge, it's noise -- force
+    # WATCH rather than picking whichever is marginally higher.
+    if abs(long_score - short_score) < MIN_SCORE_MARGIN:
+        return "WATCH"
 
     if long_score >= short_score:
         if long_score >= strong:
@@ -531,9 +595,7 @@ def build_dashboard(daily_df: pd.DataFrame, h4_df: pd.DataFrame, ltf_df: pd.Data
     """
     Runs the entire pipeline once and collects every intermediate output
     (trend, strength, setup, scores, signal, trade_levels, and optionally
-    position sizing) into one dict — the "output/dashboard" surface
-    referenced in your spec for `trend`. Returns data only; it doesn't
-    print anything (see module docstring re: _print_dashboard removal).
+    position sizing) into one dict. Returns data only; doesn't print.
 
     Parameters
     ----------
@@ -553,7 +615,7 @@ def build_dashboard(daily_df: pd.DataFrame, h4_df: pd.DataFrame, ltf_df: pd.Data
     strength = get_market_strength(ltf_df)
     last_close = float(ltf_df["close"].iloc[-1])
     setup = evaluate_setup(trend, strength, liquidity, volume_profile, last_close)
-    scores = compute_conviction(setup)
+    scores = compute_conviction(setup, strength)
     signal = generate_signal(scores)
     trade_levels = compute_trade_levels(signal, last_close, strength["atr"], liquidity)
 
