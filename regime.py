@@ -34,10 +34,6 @@ Design notes / assumptions (flag and change as needed):
     news.check_news_regime() first; if it reports regime="NEWS", that's
     returned immediately and classify_regime() (price action) never
     runs at all — matches your if/elif/else priority ordering exactly.
-  * BREAKING CHANGE from the previous version: classify_regime()'s
-    returned dict key is now "regime" (e.g. "TRENDING"), not "label" —
-    renamed so it lines up with news.py's "regime" key and a UI can
-    read the same field name regardless of which filter produced it.
   * classify_market_state() always returns the same flat shape so a UI
     can destructure it identically no matter which branch fired:
         {
@@ -55,30 +51,7 @@ Design notes / assumptions (flag and change as needed):
         }
   * Regime is scored on FOUR factors per side (TRENDING vs
     CONSOLIDATION), mirroring strategy.py's evaluate_setup() style —
-    itemized, points-based, not a single binary check:
-
-      TRENDING (25 pts each, max 100):
-        - adx_high            : ADX >= REGIME_ADX_THRESHOLD
-        - ema_structure_aligned: daily EMA20/EMA50 clearly separated AND
-                                 aligned with price AND sloping (reuses
-                                 strategy.get_higher_timeframe_trend()'s
-                                 daily_trend_bullish/bearish flags)
-        - price_directional    : net price move over REGIME_LOOKBACK bars,
-                                 normalized by ATR, exceeds
-                                 DIRECTIONAL_MOVE_ATR_MULT
-        - htf_agreement        : Daily AND 4H trend agree (both bullish
-                                 or both bearish)
-
-      CONSOLIDATION (25 pts each, max 100):
-        - adx_low              : ADX < REGIME_ADX_THRESHOLD
-        - narrow_range         : (rolling high-low range) / price over
-                                 REGIME_LOOKBACK bars <= NARROW_RANGE_PCT
-        - ema_flat_intertwined : EMA20/EMA50 spread is tight AND neither
-                                 EMA is clearly rising or falling
-        - htf_disagreement     : Daily and 4H trend do NOT agree
-
-    Higher score wins the label; confidence is "high" when the winning
-    score's margin over the other is >=50, else "low".
+    itemized, points-based, not a single binary check.
   * classify_regime() takes both daily_df and h4_df (Daily/4H agreement
     needs both frames).
   * All thresholds (REGIME_ADX_THRESHOLD, DIRECTIONAL_MOVE_ATR_MULT,
@@ -91,6 +64,7 @@ Design notes / assumptions (flag and change as needed):
     5-tier vocabulary) rather than a separate "NO TRADE" label.
 """
 from __future__ import annotations
+import os
 import pandas as pd
 from datetime import datetime
 
@@ -98,6 +72,22 @@ from indicators import ema, atr, adx
 from news import check_news_regime, NEWS_BLOCKING_IMPACTS
 
 import strategy
+
+# ---------------------------------------------------------------------
+# Observation mode — off by default. Set REGIME_GATE_MODE=observe in
+# private.env (or `export REGIME_GATE_MODE=observe` before running) to
+# watch strategy.py's real scoring against live ticks WITHOUT the
+# regime gate blocking trade_allowed. The regime is still classified
+# and shown as normal (so you can see what it thinks is happening) --
+# only the pass/fail gate is bypassed. Does NOT bypass the NEWS check;
+# that's a different kind of gate (external event risk), not something
+# you'd want to skip just to observe scoring behavior.
+# ---------------------------------------------------------------------
+REGIME_GATE_MODE = os.getenv("REGIME_GATE_MODE", "enforce")  # "enforce" | "observe"
+if REGIME_GATE_MODE == "observe":
+    print("regime.py: REGIME_GATE_MODE=observe -- regime gate is BYPASSED. "
+          "Signals will fire regardless of TRENDING/CONSOLIDATION classification. "
+          "Set REGIME_GATE_MODE=enforce (or unset it) to restore normal behavior.")
 
 
 # ---------------------------------------------------------------------
@@ -109,7 +99,7 @@ REGIME_LOOKBACK = 20             # bars used for the range / directional-move ch
 DIRECTIONAL_MOVE_ATR_MULT = 3.0  # net move over the lookback, in ATRs, to count as "directional"
 NARROW_RANGE_PCT = 0.03          # (rolling high-low range) / price <= this counts as "narrow"
 EMA_SPREAD_FLAT_PCT = 0.005      # |EMA20-EMA50| / price <= this counts as "intertwined"
-EMA_FLAT_LOOKBACK = 3            # bars back used to judge EMA "flatness" (reuses strategy's slope lookback style)
+EMA_FLAT_LOOKBACK = 3            # bars back used to judge EMA "flatness"
 
 REGIME_SCORE_MARGIN_FOR_HIGH_CONFIDENCE = 50  # winning score must lead by this much for "high" confidence
 
@@ -135,8 +125,6 @@ DEFAULT_ALLOWED_REGIMES = ("TRENDING",)
 # ---------------------------------------------------------------------
 
 def _is_flat(series: pd.Series, lookback: int = EMA_FLAT_LOOKBACK, tol_pct: float = EMA_SPREAD_FLAT_PCT) -> bool:
-    """True if the series has barely moved over `lookback` bars — used
-    to judge whether an EMA is sloping or sitting flat."""
     if len(series) <= lookback:
         return False
     then = series.iloc[-1 - lookback]
@@ -146,9 +134,6 @@ def _is_flat(series: pd.Series, lookback: int = EMA_FLAT_LOOKBACK, tol_pct: floa
 
 
 def _price_range_pct(df: pd.DataFrame, lookback: int = REGIME_LOOKBACK) -> float | None:
-    """(rolling high - rolling low) / latest close, over the trailing
-    `lookback` bars — a small value means price has stayed inside a
-    narrow range."""
     if len(df) < lookback:
         return None
     window = df.iloc[-lookback:]
@@ -159,9 +144,6 @@ def _price_range_pct(df: pd.DataFrame, lookback: int = REGIME_LOOKBACK) -> float
 
 
 def _directional_move_in_atr(df: pd.DataFrame, atr_value: float, lookback: int = REGIME_LOOKBACK) -> float | None:
-    """Net price change over `lookback` bars, expressed in multiples of
-    ATR — large values mean price has been moving persistently in one
-    direction rather than churning sideways."""
     if len(df) <= lookback or atr_value in (None, 0) or pd.isna(atr_value):
         return None
     net_move = abs(df["close"].iloc[-1] - df["close"].iloc[-1 - lookback])
@@ -200,20 +182,8 @@ def compute_regime_metrics(daily_df: pd.DataFrame, h4_df: pd.DataFrame) -> dict:
 
 def classify_regime(daily_df: pd.DataFrame, h4_df: pd.DataFrame) -> dict:
     """
-    Scores TRENDING and CONSOLIDATION independently on four factors each
-    (see module docstring), and returns the higher-scoring regime.
-
-    Returns:
-        {
-            "regime": "TRENDING" | "CONSOLIDATION",
-            "confidence": "high" | "low",
-            "reason": str,
-            "trending_score": int,
-            "consolidation_score": int,
-            "trending_conditions": {name: {"met": bool, "points": int}, ...},
-            "consolidation_conditions": {name: {"met": bool, "points": int}, ...},
-            "adx": float, "atr": float, ...  # supporting metrics
-        }
+    Scores TRENDING and CONSOLIDATION independently on four factors each,
+    and returns the higher-scoring regime.
     """
     metrics = compute_regime_metrics(daily_df, h4_df)
     trend = metrics["trend"]
@@ -273,9 +243,28 @@ def classify_regime(daily_df: pd.DataFrame, h4_df: pd.DataFrame) -> dict:
     }
 
 
-def is_market_suitable(regime: dict, allowed_regimes=DEFAULT_ALLOWED_REGIMES) -> bool:
-    """True if the classified regime is one the strategy should trade in."""
-    return regime.get("regime") in allowed_regimes
+def is_market_suitable(regime: dict, allowed_regimes=DEFAULT_ALLOWED_REGIMES,
+                        require_high_confidence: bool = True) -> bool:
+    """True if the classified regime is one the strategy should trade in.
+
+    Institutional-grade tightening: also requires confidence == "high"
+    by default. classify_regime() already computes a trending_score vs
+    consolidation_score margin and labels confidence "low" when that
+    margin is thin (< REGIME_SCORE_MARGIN_FOR_HIGH_CONFIDENCE) -- a
+    "TRENDING" label sitting on a close score was previously treated
+    identically to an unambiguous one. Requiring "high" only trades
+    regimes where the trending-vs-consolidation call wasn't a close one.
+
+    Bypassed entirely (always returns True) when REGIME_GATE_MODE=observe
+    -- see module docstring / the REGIME_GATE_MODE block near the top of
+    this file."""
+    if REGIME_GATE_MODE == "observe":
+        return True
+    if regime.get("regime") not in allowed_regimes:
+        return False
+    if require_high_confidence and regime.get("confidence") != "high":
+        return False
+    return True
 
 
 def classify_market_state(daily_df: pd.DataFrame, h4_df: pd.DataFrame,
@@ -290,13 +279,6 @@ def classify_market_state(daily_df: pd.DataFrame, h4_df: pd.DataFrame,
             regime = "TRENDING"
         else:
             regime = "CONSOLIDATION"
-
-    Checks news first — if a blocking event is active, returns
-    news.check_news_regime()'s dict as-is (regime="NEWS",
-    trade_allowed=False, plus event details) and never runs the
-    price-action classifier at all. Otherwise runs classify_regime()
-    and merges in trade_allowed / news-context fields so the return
-    shape is identical regardless of which branch fired.
     """
     news_state = check_news_regime(news_events, now)
 
@@ -305,9 +287,26 @@ def classify_market_state(daily_df: pd.DataFrame, h4_df: pd.DataFrame,
 
     price_regime = classify_regime(daily_df, h4_df)
     trade_allowed = is_market_suitable(price_regime, allowed_regimes)
-    reason = price_regime["reason"] + (
-        "" if trade_allowed else f" Regime not in allowed_regimes {allowed_regimes} — trade not allowed."
+
+    # Would this have been blocked under normal (enforce) rules? Computed
+    # separately from the actual trade_allowed above so the reason text
+    # can flag it even while REGIME_GATE_MODE=observe is bypassing it --
+    # a bypassed signal should never look identical to a genuinely
+    # unblocked one.
+    would_be_allowed_if_enforced = (
+        price_regime.get("regime") in allowed_regimes
+        and price_regime.get("confidence") == "high"
     )
+
+    if REGIME_GATE_MODE == "observe" and not would_be_allowed_if_enforced:
+        reason = price_regime["reason"] + (
+            " [OBSERVATION MODE: regime gate bypassed -- this would normally "
+            f"be blocked: not in allowed_regimes {allowed_regimes} or confidence not high.]"
+        )
+    else:
+        reason = price_regime["reason"] + (
+            "" if trade_allowed else f" Regime not in allowed_regimes {allowed_regimes} — trade not allowed."
+        )
 
     return {
         "regime": price_regime["regime"],
@@ -331,14 +330,9 @@ def run_pipeline(daily_df: pd.DataFrame, h4_df: pd.DataFrame, ltf_df: pd.DataFra
                   news_events: list[dict] | None = None, now: datetime | None = None,
                   allowed_regimes=DEFAULT_ALLOWED_REGIMES) -> dict:
     """
-    Runs the full diagram:
-        Market Data -> News Filter -> Regime Filter -> Is market suitable?
-        -> Strategy (Trend + Volume Profile + Liquidity Sweep -> Conviction -> Signal)
-
-    News is checked first via classify_market_state(); a blocking event
-    short-circuits everything below it (regime="NEWS", strategy.py never
-    runs). Otherwise the price-action regime decides whether strategy.py's
-    pipeline runs at all.
+    Runs the full diagram: Market Data -> News Filter -> Regime Filter ->
+    Is market suitable? -> Strategy (Trend + Volume Profile + Liquidity
+    Sweep -> Conviction -> Signal).
     """
     regime = classify_market_state(daily_df, h4_df, news_events=news_events, now=now,
                                     allowed_regimes=allowed_regimes)
@@ -366,57 +360,3 @@ def run_pipeline(daily_df: pd.DataFrame, h4_df: pd.DataFrame, ltf_df: pd.DataFra
         "reason": None,
         **dashboard,
     }
-
-
-if __name__ == "__main__":
-    # Minimal smoke test with synthetic data so the file runs standalone.
-    import numpy as np
-    from pprint import pprint
-    from datetime import timedelta
-
-    rng = np.random.default_rng(7)
-
-    def fake_trending_ohlc(n, start=100.0, drift=0.8, noise=0.15):
-        close = start + np.cumsum(np.full(n, drift) + rng.normal(0, noise, n))
-        high = close + rng.uniform(0.05, 0.2, n)
-        low = close - rng.uniform(0.05, 0.2, n)
-        vol = rng.uniform(1000, 5000, n)
-        return pd.DataFrame({"high": high, "low": low, "close": close, "volume": vol})
-
-    def fake_choppy_ohlc(n, start=100.0, amplitude=1.0, noise=0.1):
-        # Oscillates around a fixed level with no net drift — genuinely
-        # sideways, unlike a noisy random walk (which can still trend).
-        close = start + amplitude * np.sin(np.linspace(0, 15, n)) + rng.normal(0, noise, n)
-        high = close + rng.uniform(0.05, 0.2, n)
-        low = close - rng.uniform(0.05, 0.2, n)
-        vol = rng.uniform(1000, 5000, n)
-        return pd.DataFrame({"high": high, "low": low, "close": close, "volume": vol})
-
-    from volume_profile import calculate_volume_profile
-
-    print("--- TRENDING market, no news ---")
-    daily_df = fake_trending_ohlc(150)
-    h4_df = fake_trending_ohlc(150)
-    ltf_df = fake_trending_ohlc(60)
-    liquidity = strategy.compute_liquidity_state(ltf_df)
-    vp = calculate_volume_profile(ltf_df, bins=20)
-    pprint(run_pipeline(daily_df, h4_df, ltf_df, liquidity, vp, capital=100000, risk_percent=1.0))
-
-    print("\n--- CONSOLIDATION market, no news ---")
-    daily_df_chop = fake_choppy_ohlc(150)
-    h4_df_chop = fake_choppy_ohlc(150)
-    ltf_df_chop = fake_choppy_ohlc(60)
-    liquidity_chop = strategy.compute_liquidity_state(ltf_df_chop)
-    vp_chop = calculate_volume_profile(ltf_df_chop, bins=20)
-    pprint(run_pipeline(daily_df_chop, h4_df_chop, ltf_df_chop, liquidity_chop, vp_chop,
-                         capital=100000, risk_percent=1.0))
-
-    print("\n--- TRENDING market, but a HIGH-impact event is 10 min away ---")
-    from datetime import timezone
-    now = datetime.now(timezone.utc)
-    news_events = [
-        {"name": "FOMC Rate Decision", "time": now + timedelta(minutes=10), "impact": "HIGH"},
-        {"name": "Retail Sales", "time": now + timedelta(hours=3), "impact": "LOW"},
-    ]
-    pprint(run_pipeline(daily_df, h4_df, ltf_df, liquidity, vp,
-                         capital=100000, risk_percent=1.0, news_events=news_events, now=now))
