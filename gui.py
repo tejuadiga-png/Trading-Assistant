@@ -1147,4 +1147,5 @@ ui.run(
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8080)),
     storage_secret=STORAGE_SECRET,
+    reload=False, show=False
 )
