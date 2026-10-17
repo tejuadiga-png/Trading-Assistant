@@ -21,12 +21,18 @@ IST = pytz.timezone("Asia/Kolkata")
 # and skip the password screen entirely, which is a worse hole than a weak
 # password would be. Both are required, not just PASSWORD.
 PASSWORD = os.getenv("DASHBOARD_PASSWORD")
-STORAGE_SECRET = os.getenv("STORAGE_SECRET")
-if not PASSWORD or not STORAGE_SECRET:
+if not PASSWORD:
     raise RuntimeError(
-        "DASHBOARD_PASSWORD and STORAGE_SECRET must both be set in the "
-        "environment/private.env — no defaults are provided on purpose."
+        "DASHBOARD_PASSWORD must be set in the environment/private.env — "
+        "no default is provided on purpose."
     )
+
+# STORAGE_SECRET is optional: if unset we generate a random one at startup.
+# That's secure (unguessable), the only cost is that all logged-in sessions
+# are invalidated whenever the server restarts. Set it explicitly in your
+# deploy env if you want logins to survive restarts.
+import secrets
+STORAGE_SECRET = os.getenv("STORAGE_SECRET") or secrets.token_urlsafe(32)
 
 SYMBOL      = "NIFTY 50"
 NIFTY_LOT   = 75          # update per NSE circular
@@ -1147,5 +1153,4 @@ ui.run(
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8080)),
     storage_secret=STORAGE_SECRET,
-    reload=False, show=False
 )
